@@ -8,6 +8,7 @@ import android.media.MediaRecorder
 import android.os.Bundle
 import android.util.Base64
 import android.widget.Button
+import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -32,6 +33,10 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var btnRecord: Button
     private lateinit var tvResult: TextView
+    private lateinit var emotionProgressBar: ProgressBar
+    private lateinit var mainLayout: android.widget.LinearLayout
+    private var backgroundAnimator: android.animation.ValueAnimator? = null
+    private var buttonPulseAnimator: android.animation.ValueAnimator? = null
 
     private val client = OkHttpClient()
 
@@ -62,6 +67,8 @@ class MainActivity : AppCompatActivity() {
 
         btnRecord = findViewById(R.id.btnRecord)
         tvResult = findViewById(R.id.tvResult)
+        emotionProgressBar = findViewById(R.id.emotionProgressBar)
+        mainLayout = findViewById(R.id.mainLayout)
 
         btnRecord.setOnClickListener {
             val granted = ContextCompat.checkSelfPermission(
@@ -75,6 +82,81 @@ class MainActivity : AppCompatActivity() {
                 requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
             }
         }
+    }
+    /**
+     * 根据情感积极概率（0.0到1.0）返回一个渐变色。
+     * @param prob 积极概率
+     * @return 对应的颜色值
+     */
+    private fun getColorForProbability(prob: Double): Int {
+        // 确保概率在0-1之间
+        val safeProb = prob.coerceIn(0.0, 1.0).toFloat()
+        val red: Float
+        val green: Float
+
+        if (safeProb < 0.5f) {
+            // 低概率（偏消极）：红色为主，绿色逐渐增加
+            red = 1.0f
+            green = safeProb * 2 // 0.0 -> 1.0
+        } else {
+            // 高概率（偏积极）：绿色为主，红色逐渐减少
+            red = (1.0f - safeProb) * 2 // 1.0 -> 0.0
+            green = 1.0f
+        }
+        // 将RGB分量（0-1）转换为Android的颜色整数
+        return android.graphics.Color.rgb((red * 255).toInt(), (green * 255).toInt(), 0)
+    }
+    // ==================== 背景呼吸动画函数 ====================
+    private fun startBackgroundBreathAnimation() {
+        backgroundAnimator?.cancel()
+        val colorStart = android.graphics.Color.WHITE
+        val colorEnd = android.graphics.Color.parseColor("#F3E5F5") // 浅紫色
+        backgroundAnimator = android.animation.ValueAnimator.ofArgb(colorStart, colorEnd, colorStart).apply {
+            duration = 2000
+            repeatCount = android.animation.ValueAnimator.INFINITE
+            repeatMode = android.animation.ValueAnimator.REVERSE
+            interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+            addUpdateListener { animator ->
+                mainLayout.setBackgroundColor(animator.animatedValue as Int)
+            }
+        }
+        backgroundAnimator?.start()
+    }
+
+    private fun stopBackgroundBreathAnimation() {
+        backgroundAnimator?.cancel()
+        mainLayout.animate()
+            .setDuration(300)
+            .setInterpolator(android.view.animation.AccelerateDecelerateInterpolator())
+            .withEndAction { mainLayout.setBackgroundColor(android.graphics.Color.WHITE) }
+            .start()
+    }
+
+    // ==================== 按钮脉动动画函数 ====================
+    private fun startButtonPulseAnimation() {
+        buttonPulseAnimator?.cancel()
+        buttonPulseAnimator = android.animation.ValueAnimator.ofFloat(0.98f, 1.02f, 0.98f).apply {
+            duration = 900
+            repeatCount = android.animation.ValueAnimator.INFINITE
+            repeatMode = android.animation.ValueAnimator.REVERSE
+            interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+            addUpdateListener { animator ->
+                val scale = animator.animatedValue as Float
+                btnRecord.scaleX = scale
+                btnRecord.scaleY = scale
+            }
+        }
+        buttonPulseAnimator?.start()
+    }
+
+    private fun stopButtonPulseAnimation() {
+        buttonPulseAnimator?.cancel()
+        btnRecord.animate()
+            .scaleX(1.0f)
+            .scaleY(1.0f)
+            .setDuration(200)
+            .setInterpolator(android.view.animation.AccelerateDecelerateInterpolator())
+            .start()
     }
 
     private fun toggleRecord() {
@@ -103,6 +185,8 @@ class MainActivity : AppCompatActivity() {
         isRecording = true
         btnRecord.text = "停止录音并识别"
         tvResult.text = "正在录音…请说一句话（建议 2~5 秒）"
+        startBackgroundBreathAnimation()
+        startButtonPulseAnimation()
 
         scope.launch(Dispatchers.IO) {
             val output = ByteArrayOutputStream()
@@ -119,6 +203,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun stopRecordingAndAnalyze() {
         isRecording = false
+        stopBackgroundBreathAnimation()
+        stopButtonPulseAnimation()
         audioRecord?.stop()
         audioRecord?.release()
         audioRecord = null
@@ -148,11 +234,39 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 // 3) 情感分析：文本 -> 情绪倾向
-                val sentiment = withContext(Dispatchers.IO) {
-                    sentimentClassify(nlpToken, text)
+                // 3) 情感分析：文本 -> 情绪倾向 (同时获取积极概率)
+                lateinit var sentimentText: String
+                var positiveProb: Double = 0.5 // 默认值
+                try {
+                    val (textResult, prob) = withContext(Dispatchers.IO) {
+                        sentimentClassify(nlpToken, text)
+                    }
+                    sentimentText = textResult
+                    positiveProb = prob
+                } catch (e: Exception) {
+                    sentimentText = "情感分析失败：${e.message}"
+                    positiveProb = 0.5
                 }
 
-                tvResult.text = "识别文字：\n$text\n\n情绪结果：\n$sentiment"
+// 显示结果文本
+                tvResult.text = "识别文字：\n$text\n\n情绪结果：\n$sentimentText"
+
+// ---------- 新增：更新动态进度条 ----------
+                try {
+                    // 1. 更新进度条进度 (0-100)
+                    val progressValue = (positiveProb * 100).toInt()
+                    emotionProgressBar.progress = progressValue
+
+                    // 2. 根据积极概率计算并设置动态颜色
+                    val progressColor = getColorForProbability(positiveProb)
+                    emotionProgressBar.progressTintList = android.content.res.ColorStateList.valueOf(progressColor)
+
+                    // 3. 确保进度条可见
+                    emotionProgressBar.visibility = android.view.View.VISIBLE
+                } catch (e: Exception) {
+                    // 万一出错，不让进度条影响主功能
+                    e.printStackTrace()
+                }
 
             } catch (e: Exception) {
                 tvResult.text = "出错了：${e.message}"
@@ -225,7 +339,7 @@ class MainActivity : AppCompatActivity() {
     // -------------------------
     // 情感倾向分析：text -> sentiment
     // -------------------------
-    private fun sentimentClassify(token: String, text: String): String {
+    private fun sentimentClassify(token: String, text: String): Pair<String, Double> {
         val url =
             "https://aip.baidubce.com/rpc/2.0/nlp/v1/sentiment_classify?access_token=$token"
 
@@ -259,7 +373,11 @@ class MainActivity : AppCompatActivity() {
                     else -> "未知"
                 }
 
-                return "倾向：$label\n置信度：$confidence\n积极概率：$positiveProb\n消极概率：$negativeProb"
+                // 返回一个 Pair：第一个是显示文本，第二个是积极概率值
+                return Pair(
+                    "倾向：$label\n置信度：$confidence\n积极概率：$positiveProb\n消极概率：$negativeProb",
+                    positiveProb // 这是 Double 类型的概率值
+                )
             } else {
                 val errMsg = json.optString("error_msg", respStr)
                 error("情感分析失败：$errMsg")
